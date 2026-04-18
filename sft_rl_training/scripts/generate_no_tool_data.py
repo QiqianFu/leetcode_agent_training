@@ -47,7 +47,7 @@ logger = logging.getLogger(__name__)
 
 # ─── Constants ───
 
-DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "sk-REDACTED")
+DEEPSEEK_API_KEY = os.environ["DEEPSEEK_API_KEY"]  # source project-root .env first
 DEEPSEEK_CLIENT = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
 
 QWEN3_MODEL_ID = os.environ.get("QWEN3_MODEL_ID", "Qwen/Qwen3-1.7B")

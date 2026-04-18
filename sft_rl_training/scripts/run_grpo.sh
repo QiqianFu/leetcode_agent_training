@@ -23,7 +23,9 @@ MODEL_PATH="/shared/rsaas/qiqianf2/lc_agent_experiments/sft_merged_model"
 DATA_PATH="/shared/rsaas/qiqianf2/lc_agent_experiments/rl_prompts.parquet"
 OUTPUT_DIR="/shared/rsaas/qiqianf2/lc_agent_experiments/grpo_trl_exp001"
 
-export DEEPSEEK_API_KEY="sk-REDACTED"
+# Load DEEPSEEK_API_KEY (and other secrets) from project-root .env
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+set -a; . "$PROJECT_ROOT/.env"; set +a
 
 if [ "${NUM_GPUS}" -gt 1 ]; then
     conda run -n qwen_RL --no-capture-output \

@@ -24,6 +24,11 @@ venv/
 # 系统
 .DS_Store
 
+# 密钥 / 环境变量
+.env
+.env.*
+!.env.example
+
 # 模型与大文件（保险起见）
 *.ckpt
 *.safetensors

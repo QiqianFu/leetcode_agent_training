@@ -29,7 +29,7 @@ from pathlib import Path
 LEETCODE_SRC = Path(__file__).resolve().parents[1] / ".." / "leetcode_agent" / "src"
 sys.path.insert(0, str(LEETCODE_SRC))
 
-os.environ["DEEPSEEK_API_KEY"] = "sk-REDACTED"
+assert os.environ.get("DEEPSEEK_API_KEY"), "DEEPSEEK_API_KEY not set — source project-root .env first"
 os.environ["MAX_AGENT_HISTORY_MESSAGES"] = "500"
 
 from openai import OpenAI

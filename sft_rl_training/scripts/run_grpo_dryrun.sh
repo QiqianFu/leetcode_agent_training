@@ -17,7 +17,9 @@ MODEL=/shared/rsaas/qiqianf2/lc_agent_experiments/sft_merged_model
 DATA=/shared/rsaas/qiqianf2/lc_agent_experiments/rl_prompts.parquet
 OUT=/shared/rsaas/qiqianf2/lc_agent_experiments/grpo_dryrun
 
-export DEEPSEEK_API_KEY="sk-REDACTED"
+# Load DEEPSEEK_API_KEY (and other secrets) from project-root .env
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+set -a; . "$PROJECT_ROOT/.env"; set +a
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 NUM_GPUS=$(echo "$CUDA_VISIBLE_DEVICES" | tr ',' '\n' | wc -l)

@@ -17,7 +17,9 @@ DATA=/shared/rsaas/qiqianf2/lc_agent_experiments/rl_instances/v1.parquet
 INSTANCES=/shared/rsaas/qiqianf2/lc_agent_experiments/rl_instances/v1.jsonl
 OUT=/shared/rsaas/qiqianf2/lc_agent_experiments/grpo_v1_exp014
 
-export DEEPSEEK_API_KEY="sk-REDACTED"
+# Load DEEPSEEK_API_KEY (and other secrets) from project-root .env
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+set -a; . "$PROJECT_ROOT/.env"; set +a
 export RL_INSTANCES_PATH="$INSTANCES"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
