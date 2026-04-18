@@ -1,0 +1,32 @@
+# Claude / 外部子项目
+.claude/
+Agent-R1/
+
+# 实验运行产物（按 CLAUDE.md 规范，输出应在 /shared/rsaas/，这里仅防御性忽略残留）
+sft_rl_training/logs/
+sft_rl_training/workspace/
+sft_rl_training/workspace_b/
+sft_rl_training/workspace_c/
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.ipynb_checkpoints/
+
+# 虚拟环境 / 编辑器
+.venv/
+venv/
+.vscode/
+.idea/
+
+# 系统
+.DS_Store
+
+# 模型与大文件（保险起见）
+*.ckpt
+*.safetensors
+*.bin
+*.pt
+*.pth

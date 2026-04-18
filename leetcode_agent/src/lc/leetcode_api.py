@@ -1,0 +1,159 @@
+from __future__ import annotations
+
+import json
+import re
+import time
+
+import httpx
+
+from lc.config import LEETCODE_GRAPHQL_URL
+from lc.models import Problem
+
+_HEADERS = {
+    "Content-Type": "application/json",
+    "Referer": "https://leetcode.com",
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+}
+
+PROBLEM_LIST_QUERY = """
+query problemsetQuestionList($categorySlug: String, $limit: Int, $skip: Int, $filters: QuestionListFilterInput) {
+  problemsetQuestionList: questionList(
+    categorySlug: $categorySlug
+    limit: $limit
+    skip: $skip
+    filters: $filters
+  ) {
+    total: totalNum
+    questions: data {
+      frontendQuestionId: questionFrontendId
+      title
+      titleSlug
+      difficulty
+      acRate
+      topicTags { name slug }
+    }
+  }
+}
+"""
+
+PROBLEM_DETAIL_QUERY = """
+query questionData($titleSlug: String!) {
+  question(titleSlug: $titleSlug) {
+    questionId
+    questionFrontendId
+    title
+    titleSlug
+    content
+    difficulty
+    topicTags { name slug }
+    hints
+    similarQuestions
+    codeSnippets { lang langSlug code }
+  }
+}
+"""
+
+
+def _graphql(query: str, variables: dict, retries: int = 2) -> dict:
+    with httpx.Client(timeout=15) as client:
+        for attempt in range(retries + 1):
+            try:
+                resp = client.post(
+                    LEETCODE_GRAPHQL_URL,
+                    json={"query": query, "variables": variables},
+                    headers=_HEADERS,
+                )
+                if resp.status_code == 429:
+                    time.sleep(2 ** attempt)
+                    continue
+                resp.raise_for_status()
+                return resp.json()["data"]
+            except (httpx.HTTPError, KeyError):
+                if attempt < retries:
+                    time.sleep(1)
+                    continue
+                raise
+    raise ConnectionError("LeetCode API 请求失败，请检查网络连接后重试。")
+
+
+def _html_to_text(html: str) -> str:
+    """Convert HTML to markdown using markdownify."""
+    from markdownify import markdownify as md
+    text = md(html, heading_style="ATX", bullets="-")
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    # Remove surrogate characters that break UTF-8 encoding
+    text = text.encode("utf-8", errors="surrogateescape").decode("utf-8", errors="replace")
+    return text.strip()
+
+
+def search_problems(keyword: str, limit: int = 5) -> list[Problem]:
+    """Search problems by English keyword. Returns a list of matching problems."""
+    data = _graphql(PROBLEM_LIST_QUERY, {
+        "categorySlug": "",
+        "limit": limit,
+        "skip": 0,
+        "filters": {"searchKeywords": keyword},
+    })
+    questions = data.get("problemsetQuestionList", {}).get("questions", [])
+    results = []
+    for q in questions:
+        results.append(Problem(
+            id=int(q["frontendQuestionId"]),
+            title=q["title"],
+            title_slug=q["titleSlug"],
+            difficulty=q["difficulty"],
+            ac_rate=q.get("acRate"),
+            tags=[t["name"] for t in q.get("topicTags", [])],
+        ))
+    return results
+
+
+def _parse_problem_detail(title_slug: str, ac_rate: float | None = None) -> Problem:
+    """Fetch and parse full problem detail by title slug."""
+    detail_data = _graphql(PROBLEM_DETAIL_QUERY, {"titleSlug": title_slug})
+    q = detail_data["question"]
+
+    description = _html_to_text(q.get("content") or "")
+    tags = [t["name"] for t in q.get("topicTags", [])]
+
+    code_snippet = ""
+    for snippet in q.get("codeSnippets") or []:
+        if snippet.get("langSlug") == "python3":
+            code_snippet = snippet.get("code", "")
+            break
+
+    return Problem(
+        id=int(q["questionFrontendId"]),
+        title=q["title"],
+        title_slug=q["titleSlug"],
+        difficulty=q["difficulty"],
+        description=description,
+        ac_rate=ac_rate,
+        tags=tags,
+        code_snippet=code_snippet,
+    )
+
+
+def fetch_problem(problem_id: int) -> Problem:
+    """Fetch a problem by its frontend ID. Two API calls: list search + detail."""
+    data = _graphql(PROBLEM_LIST_QUERY, {
+        "categorySlug": "",
+        "limit": 5,
+        "skip": 0,
+        "filters": {"searchKeywords": str(problem_id)},
+    })
+    questions = data.get("problemsetQuestionList", {}).get("questions", [])
+    match = None
+    for q in questions:
+        if str(q["frontendQuestionId"]) == str(problem_id):
+            match = q
+            break
+    if match is None:
+        raise ValueError(f"Problem #{problem_id} not found on LeetCode")
+
+    return _parse_problem_detail(match["titleSlug"], ac_rate=match.get("acRate"))
+
+
+def fetch_problem_by_slug(title_slug: str) -> Problem:
+    """Fetch a problem by its title slug."""
+    return _parse_problem_detail(title_slug)

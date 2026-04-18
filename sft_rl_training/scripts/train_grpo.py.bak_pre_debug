@@ -1,0 +1,485 @@
+"""
+GRPO training for LeetCode Agent using TRL.
+
+Uses environment_factory for per-trajectory isolation:
+  - Each trajectory gets its own tmpdir workspace + SQLite DB
+  - Tool side-effects (file writes, DB updates) don't leak across trajectories
+  - Conversation messages are tracked and forwarded to sub-agent tools
+
+TRL's GRPOTrainer multi-turn tool calling loop:
+  Model generates tool_call → tool executes → result fed back → model continues
+  This repeats up to max_tool_calling_iterations.
+  After the trajectory completes, reward_func scores the full conversation.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import random
+import shutil
+import sqlite3
+import sys
+import logging
+import tempfile
+import threading
+from pathlib import Path
+from typing import Any
+
+import torch
+from datasets import Dataset
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from peft import LoraConfig, TaskType
+from trl import GRPOTrainer, GRPOConfig
+
+# Add leetcode_agent to path for tool execution
+LEETCODE_SRC = Path(__file__).resolve().parents[1] / ".." / "leetcode_agent" / "src"
+sys.path.insert(0, str(LEETCODE_SRC))
+
+os.environ.setdefault("DEEPSEEK_API_KEY", "sk-REDACTED")
+os.environ["TRL_EXPERIMENTAL_SILENCE"] = "1"
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
+
+# ─── Headless patches for leetcode_agent ───
+# flush_stdin patches are always needed (no interactive terminal in training)
+import lc.ui
+lc.ui.flush_stdin = lambda: None
+import lc.agent as _am
+_am.flush_stdin = lambda: None
+
+# arrow_select: patched with deterministic seed per environment instance (see LeetCodeEnvironment)
+# We store the original so we can restore if needed, but in training we always override.
+import lc.tool_impl.problems as _pm
+
+from lc import db as _lc_db_module
+from lc.tools import execute_tool
+
+# OpenAI client for sub-agent tools (shared across environments — stateless HTTP client)
+from openai import OpenAI
+_lc_client = OpenAI(
+    api_key=os.environ["DEEPSEEK_API_KEY"],
+    base_url="https://api.deepseek.com",
+)
+
+
+# ─── LeetCode Environment for TRL environment_factory ───
+
+class LeetCodeEnvironment:
+    """
+    Per-trajectory isolated environment for GRPO training.
+
+    Each instance gets:
+      - Its own tmpdir as workspace (cwd during tool execution)
+      - Its own SQLite DB (no cross-trajectory pollution)
+      - Its own conversation message history (for sub-agent tools)
+      - Deterministic arrow_select seeded by prompt content
+    """
+
+    def __init__(self):
+        self._tmpdir: str | None = None
+        self._db_path: Path | None = None
+        self._original_cwd: str | None = None
+        self.messages: list[dict] = []
+        self._seed: int = 42
+        self._rng = random.Random(self._seed)
+
+    # ─── reset (required by TRL) ───
+
+    def reset(self, **kwargs) -> None:
+        """
+        Called by TRL before each generation. Receives the full dataset row.
+        Sets up an isolated workspace and DB for this trajectory.
+        """
+        # Clean up previous trajectory if any
+        self._cleanup()
+
+        # Create isolated workspace
+        self._tmpdir = tempfile.mkdtemp(prefix="lc_grpo_")
+        workspace = Path(self._tmpdir)
+        (workspace / ".memories").mkdir(exist_ok=True)
+
+        # Create isolated DB
+        self._db_path = workspace / "leetcode.db"
+        conn = sqlite3.connect(str(self._db_path))
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS problem_memories (
+                problem_id    INTEGER PRIMARY KEY,
+                title         TEXT NOT NULL,
+                difficulty    TEXT,
+                tags          TEXT,
+                memory_file   TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS session (
+                key           TEXT PRIMARY KEY,
+                value         TEXT
+            );
+        """)
+        conn.commit()
+        conn.close()
+
+        # Reset conversation history
+        self.messages = []
+
+        # Deterministic seed based on prompt content for reproducible arrow_select
+        prompt = kwargs.get("prompt")
+        if prompt:
+            prompt_str = json.dumps(prompt, ensure_ascii=False, sort_keys=True)
+            self._seed = int(hashlib.md5(prompt_str.encode()).hexdigest()[:8], 16)
+        else:
+            self._seed = 42
+        self._rng = random.Random(self._seed)
+
+        return None  # no observation to append to prompt
+
+    def _cleanup(self):
+        """Remove temporary workspace."""
+        if self._tmpdir and os.path.exists(self._tmpdir):
+            shutil.rmtree(self._tmpdir, ignore_errors=True)
+            self._tmpdir = None
+
+    def __del__(self):
+        self._cleanup()
+
+    # ─── Tool execution helper ───
+
+    def _run_tool(self, name: str, **kwargs) -> str:
+        """Execute a leetcode_agent tool within this environment's isolated context."""
+        original_cwd = os.getcwd()
+        # db.py imports DB_PATH at module level: `from lc.config import DB_PATH`
+        # so we must patch db.DB_PATH directly (not lc.config.DB_PATH)
+        original_db_path = _lc_db_module.DB_PATH
+        original_db_conn = getattr(_lc_db_module._local, "conn", None)
+        original_arrow_select = lc.ui.arrow_select
+
+        try:
+            # Switch to isolated workspace
+            os.chdir(self._tmpdir)
+
+            # Point DB to isolated path (patch the reference in db module directly)
+            _lc_db_module.DB_PATH = self._db_path
+            # Force reconnection to isolated DB
+            _lc_db_module._local.conn = None
+
+            # Patch arrow_select with deterministic RNG for this environment
+            rng = self._rng
+
+            def _deterministic_select(choices, load_more=None):
+                if not choices:
+                    return None
+                return rng.choice(choices)[1]
+
+            lc.ui.arrow_select = _deterministic_select
+            _pm.arrow_select = _deterministic_select
+
+            # Execute tool, passing conversation messages for sub-agent tools
+            result = execute_tool(
+                name,
+                json.dumps(kwargs, ensure_ascii=False),
+                _lc_client,
+                self.messages,
+            )
+
+            # Track this tool call in conversation history so subsequent
+            # sub-agent tools (analyze_and_memorize, etc.) have context
+            self.messages.append({
+                "role": "assistant",
+                "tool_calls": [{"type": "function", "function": {"name": name, "arguments": kwargs}}],
+            })
+            self.messages.append({
+                "role": "tool",
+                "name": name,
+                "content": result,
+            })
+
+            return result
+        except Exception as e:
+            return json.dumps({"error": str(e)})
+        finally:
+            # Restore global state
+            os.chdir(original_cwd)
+            _lc_db_module.DB_PATH = original_db_path
+            # Close the isolated connection before restoring
+            isolated_conn = getattr(_lc_db_module._local, "conn", None)
+            if isolated_conn is not None:
+                try:
+                    isolated_conn.close()
+                except Exception:
+                    pass
+            _lc_db_module._local.conn = original_db_conn
+            lc.ui.arrow_select = original_arrow_select
+            _pm.arrow_select = original_arrow_select
+
+    # ─── Tools as methods (auto-registered by TRL) ───
+    # TRL discovers all public non-underscore methods except reset().
+    # transformers generates tool schemas from function signature + docstring.
+
+    def check_problem(self, problem_id: int) -> str:
+        """按题号查询题目信息。返回题目元信息和是否有记忆文件。
+
+        Args:
+            problem_id: 题目编号
+        """
+        return self._run_tool("check_problem", problem_id=problem_id)
+
+    def read_solution(self, problem_id: int = None, file_path: str = None) -> str:
+        """读取用户的解题代码文件。可传 file_path 或 problem_id。
+
+        Args:
+            problem_id: 题目编号（与 file_path 二选一）
+            file_path: 解题文件路径
+        """
+        kwargs = {}
+        if problem_id is not None:
+            kwargs["problem_id"] = problem_id
+        if file_path is not None:
+            kwargs["file_path"] = file_path
+        return self._run_tool("read_solution", **kwargs)
+
+    def find_problem_file(self, problem_id: int) -> str:
+        """在当前工作区内按题号查找本地解题文件。
+
+        Args:
+            problem_id: 题目编号
+        """
+        return self._run_tool("find_problem_file", problem_id=problem_id)
+
+    def append_solution(self, file_path: str, content: str) -> str:
+        """将参考解法追加到用户的解题文件末尾。
+
+        Args:
+            file_path: 解题文件路径
+            content: 参考解法代码
+        """
+        return self._run_tool("append_solution", file_path=file_path, content=content)
+
+    def pick_problem(self, tag: str = None, difficulty: str = None) -> str:
+        """从 CodeTop 高频题库推荐题目供用户选择。
+
+        Args:
+            tag: 标签筛选，如 dp, graph
+            difficulty: 难度筛选，如 Easy, Medium, Hard
+        """
+        kwargs = {}
+        if tag:
+            kwargs["tag"] = tag
+        if difficulty:
+            kwargs["difficulty"] = difficulty
+        return self._run_tool("pick_problem", **kwargs)
+
+    def search_problem(self, keyword: str) -> str:
+        """用英文关键词搜索 LeetCode 题目。
+
+        Args:
+            keyword: 英文搜索关键词
+        """
+        return self._run_tool("search_problem", keyword=keyword)
+
+    def start_problem(self, problem_id: int) -> str:
+        """开始做指定题号的 LeetCode 题。
+
+        Args:
+            problem_id: 题目编号
+        """
+        return self._run_tool("start_problem", problem_id=problem_id)
+
+    def read_memory(self, problem_id: int) -> str:
+        """读取某道题的记忆文件内容。
+
+        Args:
+            problem_id: 题目编号
+        """
+        return self._run_tool("read_memory", problem_id=problem_id)
+
+    def write_memory(self, problem_id: int, content: str, mode: str = "append") -> str:
+        """写入或追加内容到某道题的记忆文件。
+
+        Args:
+            problem_id: 题目编号
+            content: 要写入的内容
+            mode: 写入模式，append 或 overwrite
+        """
+        return self._run_tool("write_memory", problem_id=problem_id, content=content, mode=mode)
+
+    def web_search(self, query: str, max_results: int = 5) -> str:
+        """搜索互联网获取信息。
+
+        Args:
+            query: 搜索关键词
+            max_results: 返回结果数量
+        """
+        return self._run_tool("web_search", query=query, max_results=max_results)
+
+    def update_user_memory(self) -> str:
+        """更新用户偏好记忆。"""
+        return self._run_tool("update_user_memory")
+
+    def find_similar_problems(self, problem_id: int) -> str:
+        """查找与当前题目算法思路相似的已做题目。
+
+        Args:
+            problem_id: 当前题目编号
+        """
+        return self._run_tool("find_similar_problems", problem_id=problem_id)
+
+    def analyze_and_memorize(self, problem_id: int) -> str:
+        """将当前题目的分析写入记忆文件。
+
+        Args:
+            problem_id: 题目编号
+        """
+        return self._run_tool("analyze_and_memorize", problem_id=problem_id)
+
+
+# ─── Reward function ───
+
+def reward_func(completions: list[list[dict]], **kwargs) -> list[float]:
+    """
+    Compute rewards for GRPO.
+
+    Each completion is a list of message dicts representing the full trajectory.
+    Reward is outcome-based:
+      +1.0 if analyze_and_memorize was called and L3 written
+      +0.5 if read_solution was called (partial progress)
+      +0.2 if start_problem was called
+      +0.1 if any valid tool call was made
+      -0.5 if no valid tool calls at all
+    """
+    rewards = []
+    for messages in completions:
+        tool_calls_made = []
+        has_l3 = False
+
+        for msg in messages:
+            # Check assistant messages for tool calls
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                for tc in msg["tool_calls"]:
+                    fn = tc.get("function", {})
+                    tool_calls_made.append(fn.get("name", ""))
+
+            # Check tool results for L3 success
+            if msg.get("role") == "tool":
+                content = msg.get("content", "")
+                if '"l3_written": true' in content or '"l3_written":true' in content:
+                    has_l3 = True
+
+        # Compute reward
+        has_start = "start_problem" in tool_calls_made
+        has_read = "read_solution" in tool_calls_made
+        has_analyze = "analyze_and_memorize" in tool_calls_made
+
+        if has_analyze and has_l3:
+            reward = 1.0
+        elif has_read:
+            reward = 0.5
+        elif has_start:
+            reward = 0.2
+        elif tool_calls_made:
+            reward = 0.1
+        else:
+            reward = -0.5
+
+        rewards.append(reward)
+
+    return rewards
+
+
+# ─── Build dataset ───
+
+def build_dataset(data_path: str) -> Dataset:
+    """Load prompts from SFT trajectory data."""
+    import pandas as pd
+
+    df = pd.read_parquet(data_path)
+    records = []
+    for _, row in df.iterrows():
+        prompt = json.loads(row["prompt"])
+        records.append({"prompt": prompt})
+
+    return Dataset.from_list(records)
+
+
+# ─── Main ───
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model_path", default="/shared/rsaas/qiqianf2/lc_agent_experiments/sft_merged_model")
+    parser.add_argument("--data_path", default="/shared/rsaas/qiqianf2/lc_agent_experiments/rl_prompts.parquet")
+    parser.add_argument("--output_dir", default="/shared/rsaas/qiqianf2/lc_agent_experiments/grpo_trl_exp001")
+    args = parser.parse_args()
+
+    # Load tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    # Build dataset
+    dataset = build_dataset(args.data_path)
+    logger.info(f"Dataset: {len(dataset)} prompts")
+
+    # Split train/eval
+    split = dataset.train_test_split(test_size=0.05, seed=42)
+    train_dataset = split["train"]
+    eval_dataset = split["test"]
+
+    # LoRA config
+    peft_config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        r=64,
+        lora_alpha=128,
+        lora_dropout=0.05,
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                        "gate_proj", "up_proj", "down_proj"],
+        bias="none",
+    )
+
+    # GRPO config
+    training_args = GRPOConfig(
+        output_dir=args.output_dir,
+        num_train_epochs=5,
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=8,
+        learning_rate=5e-7,
+        lr_scheduler_type="cosine",
+        warmup_ratio=0.1,
+        bf16=True,
+        logging_steps=5,
+        save_strategy="epoch",
+        save_total_limit=3,
+        report_to="none",
+        # GRPO specific
+        num_generations=4,
+        max_completion_length=1024,
+        # Tool calling
+        max_tool_calling_iterations=5,
+        # Generation
+        generation_kwargs={
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "do_sample": True,
+        },
+    )
+
+    # Initialize trainer with environment_factory for per-trajectory isolation
+    trainer = GRPOTrainer(
+        model=args.model_path,
+        reward_funcs=reward_func,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+        processing_class=tokenizer,
+        peft_config=peft_config,
+        environment_factory=LeetCodeEnvironment,
+    )
+
+    logger.info("Starting GRPO training...")
+    trainer.train()
+    trainer.save_model()
+    logger.info(f"Training complete! Model saved to {args.output_dir}")
+
+
+if __name__ == "__main__":
+    main()

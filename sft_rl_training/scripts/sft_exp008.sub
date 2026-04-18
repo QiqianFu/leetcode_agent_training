@@ -1,0 +1,18 @@
+Universe     = vanilla
+Executable   = /home/qiqianf2/LC-Agent/sft_rl_training/scripts/run_sft_exp008.sh
+
+Log          = /home/qiqianf2/LC-Agent/sft_rl_training/logs/sft_exp008_$(Cluster).log
+Output       = /home/qiqianf2/LC-Agent/sft_rl_training/logs/sft_exp008_$(Cluster).out
+Error        = /home/qiqianf2/LC-Agent/sft_rl_training/logs/sft_exp008_$(Cluster).err
+
+Requirements = (Machine == "vision-c22.cs.illinois.edu")
+
+# Let condor allocate 4 GPUs normally — this registers our job in condor's
+# accounting so the GPUs won't be re-assigned to other condor users mid-run.
+request_gpus = 4
+request_cpus = 8
+request_memory = 64GB
+
+getenv = True
+
+Queue

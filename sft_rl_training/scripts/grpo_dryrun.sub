@@ -1,0 +1,15 @@
+Universe     = vanilla
+Executable   = /home/qiqianf2/LC-Agent/sft_rl_training/scripts/run_grpo_dryrun.sh
+Log          = /home/qiqianf2/LC-Agent/sft_rl_training/logs/grpo_dryrun_$(Cluster).log
+Output       = /home/qiqianf2/LC-Agent/sft_rl_training/logs/grpo_dryrun_$(Cluster).out
+Error        = /home/qiqianf2/LC-Agent/sft_rl_training/logs/grpo_dryrun_$(Cluster).err
+
+# Prefer c22 to avoid the c23 NFS issues noted in Exp-009/Exp-010.
+Requirements = (Machine == "vision-c22.cs.illinois.edu")
+request_gpus = 1
+request_cpus = 4
+request_memory = 32GB
+
+getenv = True
+
+Queue

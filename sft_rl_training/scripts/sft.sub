@@ -1,0 +1,14 @@
+Universe     = vanilla
+Executable   = /home/qiqianf2/LC-Agent/sft_rl_training/scripts/run_sft.sh
+Log          = /home/qiqianf2/LC-Agent/sft_rl_training/logs/sft_$(Cluster).log
+Output       = /home/qiqianf2/LC-Agent/sft_rl_training/logs/sft_$(Cluster).out
+Error        = /home/qiqianf2/LC-Agent/sft_rl_training/logs/sft_$(Cluster).err
+
+Requirements = (Machine == "vision-c21.cs.illinois.edu" || Machine == "vision-c22.cs.illinois.edu" || Machine == "vision-c23.cs.illinois.edu")
+request_gpus = 2
+request_cpus = 8
+request_memory = 64GB
+
+getenv = True
+
+Queue
