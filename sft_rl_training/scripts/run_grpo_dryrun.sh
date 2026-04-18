@@ -17,9 +17,11 @@ MODEL=/shared/rsaas/qiqianf2/lc_agent_experiments/sft_merged_model
 DATA=/shared/rsaas/qiqianf2/lc_agent_experiments/rl_prompts.parquet
 OUT=/shared/rsaas/qiqianf2/lc_agent_experiments/grpo_dryrun
 
-# Load DEEPSEEK_API_KEY (and other secrets) from project-root .env
+# Load DEEPSEEK_API_KEY (and other secrets) from project-root .env — fail hard if missing
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+[ -f "$PROJECT_ROOT/.env" ] || { echo "ERROR: $PROJECT_ROOT/.env missing — cp .env.example .env and fill it in" >&2; exit 1; }
 set -a; . "$PROJECT_ROOT/.env"; set +a
+: "${DEEPSEEK_API_KEY:?ERROR: DEEPSEEK_API_KEY not set in .env}"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 NUM_GPUS=$(echo "$CUDA_VISIBLE_DEVICES" | tr ',' '\n' | wc -l)

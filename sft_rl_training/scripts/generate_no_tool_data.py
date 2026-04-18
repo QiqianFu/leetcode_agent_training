@@ -31,6 +31,10 @@ import sys
 import time
 from pathlib import Path
 
+# Fail hard at startup if key is missing, before paying the torch/transformers import cost.
+if not os.environ.get("DEEPSEEK_API_KEY"):
+    raise RuntimeError("DEEPSEEK_API_KEY not set — source project-root .env first (cp .env.example .env)")
+
 import torch
 from openai import OpenAI
 from transformers import AutoModelForCausalLM, AutoTokenizer
