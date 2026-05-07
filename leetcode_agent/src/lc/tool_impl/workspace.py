@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 
 from lc import db
-from lc.display import console
+from lc.display import console, show_problem
 from lc.workspace import (
     relative_workspace_path,
     workspace_root,
@@ -13,31 +13,89 @@ from lc.workspace import (
 
 
 def tool_check_problem(problem_id: int | None = None, **_) -> str:
+    """Local-only memory index lookup. Does NOT call LeetCode API."""
     if not problem_id:
         return "请传入 problem_id。"
 
     memory = db.get_memory(problem_id)
-    result: dict = {"problem_id": problem_id}
     if memory:
-        result.update({
+        return json.dumps({
+            "problem_id": problem_id,
             "has_memory": True,
             "title": memory["title"],
             "difficulty": memory["difficulty"],
             "tags": memory["tags"],
             "memory_file": memory["memory_file"],
-        })
-    else:
-        result["has_memory"] = False
-        try:
-            from lc.leetcode_api import fetch_problem
-            problem = fetch_problem(problem_id)
-            result.update({
-                "title": problem.title,
-                "difficulty": problem.difficulty,
-                "tags": problem.tags,
-            })
-        except Exception:
-            result["message"] = "未找到该题目信息。"
+        }, ensure_ascii=False)
+    return json.dumps({
+        "problem_id": problem_id,
+        "has_memory": False,
+    }, ensure_ascii=False)
+
+
+def tool_display_problem(problem_id: int | None = None, **_) -> str:
+    """Pretty-render a problem's full detail to user via Rich panel + markdown.
+
+    Fetches from LeetCode (so description is guaranteed). Pure UI side-effect.
+    Prefer this over inlining description text when you want the user to see
+    the problem cleanly without consuming your own output budget.
+    """
+    if not problem_id:
+        return json.dumps(
+            {"error": True, "message": "请传入 problem_id。"},
+            ensure_ascii=False,
+        )
+    try:
+        from lc.leetcode_api import fetch_problem
+        problem = fetch_problem(problem_id)
+    except Exception as e:
+        return json.dumps(
+            {"error": True, "message": f"获取题目失败: {e}"},
+            ensure_ascii=False,
+        )
+    show_problem(problem)
+    return json.dumps({
+        "status": "displayed",
+        "problem_id": problem.id,
+        "title": problem.title,
+    }, ensure_ascii=False)
+
+
+def tool_fetch_problem_detail(
+    problem_id: int | None = None,
+    title_slug: str = "",
+    include_description: bool = True,
+    **_,
+) -> str:
+    """Fetch full problem detail from LeetCode API. Does NOT create any local files."""
+    if not problem_id and not title_slug:
+        return json.dumps(
+            {"error": True, "message": "请传入 problem_id 或 title_slug（至少一个）。"},
+            ensure_ascii=False,
+        )
+    try:
+        from lc.leetcode_api import fetch_problem, fetch_problem_by_slug
+        problem = (
+            fetch_problem_by_slug(title_slug) if title_slug
+            else fetch_problem(problem_id)
+        )
+    except Exception as e:
+        return json.dumps(
+            {"error": True, "message": f"获取题目失败: {e}"},
+            ensure_ascii=False,
+        )
+
+    result: dict = {
+        "problem_id": problem.id,
+        "title": problem.title,
+        "title_slug": problem.title_slug,
+        "difficulty": problem.difficulty,
+        "tags": problem.tags,
+    }
+    if include_description and problem.description:
+        result["description"] = problem.description
+    if problem.code_snippet:
+        result["code_snippet"] = problem.code_snippet
     return json.dumps(result, ensure_ascii=False)
 
 
@@ -56,20 +114,7 @@ def tool_read_solution(file_path: str = "", problem_id: int | None = None, **_) 
         return f"路径不在工作区内: {file_path}"
     if not p.exists():
         return f"文件不存在: {file_path}"
-    content = p.read_text(encoding="utf-8")
-    # Extract problem_id from filename (e.g. "72_edit_distance.py" -> 72)
-    pid: int | None = None
-    try:
-        pid = int(p.stem.split("_")[0])
-    except (ValueError, IndexError):
-        pass
-    reminder = ""
-    if pid:
-        reminder = (
-            f"\n\n[reminder: 当你给出实质性指导后，"
-            f"记得调用 analyze_and_memorize(problem_id={pid}) 写入记忆]"
-        )
-    return content + reminder
+    return p.read_text(encoding="utf-8")
 
 
 def tool_find_problem_file(problem_id: int | None = None, **_) -> str:

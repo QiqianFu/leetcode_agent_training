@@ -17,6 +17,13 @@ DATA_DIR.mkdir(exist_ok=True)
 
 DEBUG = os.getenv("DEBUG", "").lower() in ("1", "true", "yes")
 
+# Headless mode: no TTY, no Rich Live, arrow_select auto-picks randomly.
+# Enables scripted trajectory recording for SFT data / RL rollouts without
+# patching internals externally. Check at call time (not import time) so that
+# scripts can flip the env var after importing lc modules if needed.
+def is_headless() -> bool:
+    return os.getenv("LC_HEADLESS", "").lower() in ("1", "true", "yes")
+
 DB_PATH = DATA_DIR / "leetcode.db"
 USER_MEMORY_PATH = DATA_DIR / "user_memory.md"
 

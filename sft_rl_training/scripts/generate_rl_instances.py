@@ -291,6 +291,125 @@ PLANS = [
 ]
 
 
+# ─── New archetypes for v2 (填补 v1 覆盖不足的轴向) ──────────────────────
+
+NEW_ARCHETYPES = [
+    {
+        "label": "review_weak_category_reinforce",
+        "axes": {"intent_clarity": "clear", "session_stage": "review",
+                 "preference_strength": "strong", "workspace_richness": "rich", "adversarial": False},
+        "behavior_hint": "用户复习阶段，L2 里记录的弱项是 DP（或其他），workspace 要包含该 category 至少 3 道题的 L3 记忆。"
+                         "用户说'那个 DP 我想再多练下'类需求。应结合 L2 弱项 + 历史做题记忆，"
+                         "针对性地推荐一道未做过的相关题（search_problem）或讲解一道已做过但翻车的题。"
+                         "rubric 惩罚忽视 L2 弱项、推一道随机 DP 题。",
+        "user_message_style": "'那个 DP 我想再多练下' / '背包那块我还是不熟，帮我挑一道' / '昨天那道 DP 没完全搞懂'",
+    },
+    {
+        "label": "mid_hint_escalation",
+        "axes": {"intent_clarity": "clear", "session_stage": "mid_problem_stuck",
+                 "preference_strength": "mild", "workspace_richness": "small", "adversarial": False},
+        "behavior_hint": "用户做题中已经拿过一轮轻度提示（prefix 要包含 agent 给过方向性提示 + 用户回应），"
+                         "现在说'再多讲点 / 再详细点'。应该给更具体的下一步（比如伪代码骨架 / 具体变量命名），"
+                         "但不贴可直接提交的完整实现。rubric 关注 hint 层级递进，不能再给同样泛的提示。",
+        "user_message_style": "'再多讲点' / '能再具体些吗' / '我还是不太懂，举个例子'",
+    },
+    {
+        "label": "mid_bug_complexity_tradeoff",
+        "axes": {"intent_clarity": "clear", "session_stage": "mid_problem_bug",
+                 "preference_strength": "mild", "workspace_richness": "small", "adversarial": False},
+        "behavior_hint": "用户 user_code 逻辑正确但复杂度不优（比如 O(n²) 暴力而题目要求 O(n)），"
+                         "用户问'这样对吗'。应 read_solution，指出'答案正确但复杂度不达标'，"
+                         "并引导往更优解方向（如滑动窗口 / 哈希 / DP）。rubric 惩罚只说'对了'或只 memorize 不提复杂度。",
+        "user_message_style": "'我这样写对吗' / '能过吗这版' / '这样应该 AC 吧'",
+    },
+    {
+        "label": "pre_bulk_time_budget",
+        "axes": {"intent_clarity": "semi_clear", "session_stage": "pre_problem",
+                 "preference_strength": "mild", "workspace_richness": "small", "adversarial": False},
+        "behavior_hint": "用户给出时间预算（如'30 分钟'、'睡前'、'午休空档'），需要一道能做完的题。"
+                         "应该 acknowledge 时间约束 + 根据 L2 偏好或 workspace 已做情况选一道难度匹配的（pick_problem 或 search_problem + 难度），"
+                         "不要长篇反问。rubric 关注：时间约束被显式响应、难度选择合理（不是 hard）、没有长 clarify。",
+        "user_message_style": "'我只有 30 分钟' / '睡前刷一道' / '午休空 15 分钟给我推荐一道'",
+    },
+    {
+        "label": "mid_start_with_followup_twist",
+        "axes": {"intent_clarity": "clear", "session_stage": "mid_problem_start",
+                 "preference_strength": "mild", "workspace_richness": "rich", "adversarial": False},
+        "behavior_hint": "用户刚开完题（current_problem 已存在），但紧接着问一个**超出当前题**的延伸问题："
+                         "如'这个数据结构用场景我还没完全理解' / '这题如果是分布式/streaming 版会怎么做'。"
+                         "应该简短回应延伸思考（不失焦），同时提醒回到当前题；或用 web_search 查相关概念。"
+                         "rubric 惩罚：完全忽略延伸问题、或陷入延伸讨论放任当前题。",
+        "user_message_style": "'这个数据结构主要用场景是啥来着' / '这题的 streaming 版你知道怎么做吗'",
+    },
+]
+
+
+# ─── Variant expansion ──────────────────────────────────────────────────
+
+VARIATION_SALT_POOL = [
+    "specific problem 用一道 Easy 题，persona 用在校学生",
+    "specific problem 用一道 Hard 题，persona 用在职工程师面试准备",
+    "user 的措辞更简短口语化（如'草'、'晕'这类语气词），中英文混用",
+    "L1 / L2 内容用更正式的书面语，user 偏技术对话风格",
+    "用一道图论或 BFS 题（避开 v1 已经用过的 LRU Cache / Coin Change / 反转链表）",
+    "persona 描述里提到具体公司（Meta / Google / 字节）；L1 里提面试风格",
+]
+
+
+def build_all_plans(base_plans: list[dict], new_archetypes: list[dict],
+                    variants_per_archetype: int) -> list[dict]:
+    """Produce the full list of concrete plans with sequential rl_inst_XXXX IDs.
+
+    Layout:
+      - rl_inst_0001..{len(base)}: variant 0 of each base archetype (original v1 plans)
+      - rl_inst_{len(base)+1}..: variants 1..N-1 of base archetypes, grouped by variant
+      - Then: all variants of new_archetypes, grouped by archetype
+
+    This keeps existing v1 IDs stable while appending new variants at the end.
+    """
+    all_plans = []
+    n_base = len(base_plans)
+    next_id = 1
+
+    # Base archetypes: variant 0 (= original plan as given)
+    for a_idx, bp in enumerate(base_plans):
+        plan = dict(bp)
+        plan["archetype_label"] = bp["label"]
+        plan["variant_idx"] = 0
+        plan["variation_salt"] = ""
+        # Keep the original id (rl_inst_0001..0020)
+        all_plans.append(plan)
+        next_id += 1
+
+    # Base archetypes: variants 1..N-1 (NEW)
+    for v_idx in range(1, variants_per_archetype):
+        for a_idx, bp in enumerate(base_plans):
+            plan = dict(bp)
+            plan["id"] = f"rl_inst_{next_id:04d}"
+            plan["archetype_label"] = bp["label"]
+            plan["variant_idx"] = v_idx
+            # Pick a deterministic salt
+            plan["variation_salt"] = VARIATION_SALT_POOL[(v_idx - 1) % len(VARIATION_SALT_POOL)]
+            all_plans.append(plan)
+            next_id += 1
+
+    # New archetypes: variants 0..N-1 (all NEW)
+    for a_idx, na in enumerate(new_archetypes):
+        for v_idx in range(variants_per_archetype):
+            plan = dict(na)
+            plan["id"] = f"rl_inst_{next_id:04d}"
+            plan["archetype_label"] = na["label"]
+            plan["variant_idx"] = v_idx
+            if v_idx == 0:
+                plan["variation_salt"] = ""
+            else:
+                plan["variation_salt"] = VARIATION_SALT_POOL[(v_idx - 1) % len(VARIATION_SALT_POOL)]
+            all_plans.append(plan)
+            next_id += 1
+
+    return all_plans
+
+
 # ─── Output JSON schema (shown in prompt to codex) ───────────────────────
 
 OUTPUT_SCHEMA = r"""
@@ -356,9 +475,11 @@ PROMPT_TEMPLATE = """\
 
 - id: {plan_id}
 - label: {label}
+- archetype: {archetype_label}（variant #{variant_idx}）
 - 轴向: {axes_json}
 - 期望行为: {behavior_hint}
 - user_message 风格参考: {user_message_style}
+{variation_hint}
 
 # 硬性要求
 
@@ -518,36 +639,68 @@ def validate(inst: dict, plan: dict) -> list[str]:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", required=True, help="Output JSONL path")
-    parser.add_argument("--start", type=int, default=0, help="Plan index to start at")
+    parser.add_argument("--start", type=int, default=0, help="Plan index to start at (0-based into the expanded plan list)")
     parser.add_argument("--limit", type=int, default=None, help="Max number of plans to run")
     parser.add_argument("--retry", type=int, default=1, help="Retries per plan on validation failure")
+    parser.add_argument("--variants-per-archetype", type=int, default=1,
+                        help="Generate N variants per archetype. N=1 reproduces the v1 plan list exactly. "
+                             "N=6 plus NEW_ARCHETYPES gives 150 plans.")
+    parser.add_argument("--skip-ids-in", type=Path, default=None,
+                        help="Path to a JSONL whose `id` field lists instances to SKIP (already generated). "
+                             "Useful for resuming v2 without regenerating v1.")
     args = parser.parse_args()
 
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    plans = PLANS[args.start:]
+    # Expand: base archetypes + new archetypes × variants
+    expanded = build_all_plans(PLANS, NEW_ARCHETYPES, args.variants_per_archetype)
+
+    # Skip existing IDs if requested
+    skip_ids: set[str] = set()
+    if args.skip_ids_in and args.skip_ids_in.exists():
+        with open(args.skip_ids_in) as f:
+            for line in f:
+                try:
+                    skip_ids.add(json.loads(line)["id"])
+                except Exception:
+                    continue
+        print(f"Loaded {len(skip_ids)} ids to skip from {args.skip_ids_in}")
+
+    plans = [p for p in expanded[args.start:] if p["id"] not in skip_ids]
     if args.limit is not None:
         plans = plans[:args.limit]
 
-    print(f"Plan count: {len(plans)}  |  output → {out_path}")
+    print(f"Total plans (expanded): {len(expanded)}")
+    print(f"After skip+start+limit: {len(plans)}  |  output → {out_path}")
     print(f"Codex model: {CODEX_MODEL}  effort: {CODEX_EFFORT}")
 
     n_ok, n_fail = 0, 0
     # Append mode so re-runs don't clobber earlier successes
-    mode = "a" if args.start > 0 and out_path.exists() else "w"
+    mode = "a" if (args.start > 0 or skip_ids) and out_path.exists() else "w"
     with open(out_path, mode, encoding="utf-8") as f:
         for i, plan in enumerate(plans):
             idx = args.start + i
-            print(f"\n[{idx+1}/{args.start + len(plans)}] {plan['id']} — {plan['label']}")
+            print(f"\n[{i+1}/{len(plans)}] {plan['id']} — {plan['archetype_label']} (variant #{plan.get('variant_idx', 0)})")
+
+            variation_hint = ""
+            if plan.get("variation_salt"):
+                variation_hint = (
+                    f"- variation salt（本 variant 独有的变化要求，必须体现）: "
+                    f"{plan['variation_salt']}\n"
+                    "- 必须和同 archetype 的其他 variant **具体内容不同**（题目 id / persona 细节 / L1 措辞 / user 措辞）"
+                )
 
             prompt = PROMPT_TEMPLATE.format(
                 lc_context=LC_AGENT_CONTEXT,
                 plan_id=plan["id"],
                 label=plan["label"],
+                archetype_label=plan.get("archetype_label", plan["label"]),
+                variant_idx=plan.get("variant_idx", 0),
                 axes_json=json.dumps(plan["axes"], ensure_ascii=False),
                 behavior_hint=plan["behavior_hint"],
                 user_message_style=plan["user_message_style"],
+                variation_hint=variation_hint,
                 schema=OUTPUT_SCHEMA,
             )
 

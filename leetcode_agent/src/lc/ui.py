@@ -17,10 +17,15 @@ def flush_stdin():
         except Exception:
             pass
     else:
+        # Only flush when stdin is a real TTY. On EOF stdin (pipes/non-interactive),
+        # select() reports readable but read(1) returns "" → infinite loop.
+        if not sys.stdin.isatty():
+            return
         import select
         try:
             while select.select([sys.stdin], [], [], 0)[0]:
-                sys.stdin.read(1)
+                if sys.stdin.read(1) == "":
+                    break
         except Exception:
             pass
 
@@ -40,6 +45,15 @@ def arrow_select(choices: list[tuple[str, any]], load_more=None) -> any | None:
     If *load_more* is a callable, pressing 'n' will call it to get more
     choices (list of (label, value) tuples) which are appended to the list.
     """
+    if not choices:
+        return None
+
+    from lc.config import is_headless
+    if is_headless():
+        import random
+        _, value = random.choice(choices)
+        return value
+
     if sys.platform == "win32":
         return _arrow_select_windows(choices, load_more=load_more)
     import tty

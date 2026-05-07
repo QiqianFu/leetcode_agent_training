@@ -30,6 +30,9 @@ def _pick_from_codetop(
 
     target = limit * 5 if randomize else limit
 
+    # Normalize difficulty: "easy" / "EASY" / "Easy" → "Easy" (matches CodeTop's form)
+    difficulty_norm = (difficulty or "").strip().title() or None
+
     # Only pass tag to CodeTop if it can resolve it server-side
     server_tag = tag if (tag and _find_tag_id(tag) is not None) else None
 
@@ -64,7 +67,7 @@ def _pick_from_codetop(
                     continue
                 if cp.leetcode_id in seen_ids:
                     continue
-                if difficulty and cp.difficulty != difficulty:
+                if difficulty_norm and (cp.difficulty or "").title() != difficulty_norm:
                     continue
                 seen_ids.add(cp.leetcode_id)
                 candidates.append(Problem(

@@ -863,7 +863,400 @@ Output: `/shared/rsaas/qiqianf2/lc_agent_experiments/grpo_v1_exp014/`
 | entropy | 0.57-0.88 | 略降（策略收敛） | 掉到 <0.2（mode collapse） |
 | completions/mean_length | 196 中位 | 类似 | 掉到 20-50（退化成短回复） |
 
-（结果待回填）
+**第一次 submit (job 10097, c22)**:
+- RSS 1h 只涨到 407 MB（Exp-014 同时点 1.8 GB），同节点有 jaym2 的 99% CPU + 19.5 GB RSS 任务挤 NFS
+- Kill 重投
+
+**第二次 submit (job 10113, c21)**:
+- 取到 c21（idle 6 GPU），但 RSS 增长仍极慢（2h +2MB/5min）
+- 期间 DeepSeek API key 被 GitHub push 暴露已作废（user 已在 `.env` 更新新 key，所有 launcher 改为从 `.env` 读取）
+- Kill
+
+#### 改成 4-variant 并行
+
+- **日期**: 2026-04-18 14:21
+- **设计**: 2×2 factorial on (group_size × beta)，LR 固定 2e-6，每 exp 用 2 GPU
+- **Condor**: 4 jobs submitted to c21 / c22
+
+| 变体 | Job ID | group | beta | grad_accum | 期望 |
+|---|---|---|---|---|---|
+| 015a | 10164 | 4 | 0.01 | 2 | baseline: 合理放松 Exp-014 (0.1→0.01) |
+| 015b | 10165 | 4 | 0.001 | 2 | beta 单独效应（vs 015a） |
+| 015c | 10166 | 8 | 0.01 | 4 | group 单独效应（vs 015a） |
+| 015d | 10167 | 8 | 0.001 | 4 | 组合：大 group + 弱 KL |
+
+所有 variant:
+- 2 GPUs × per_dev_bs=1，gen_batch 维持在 4 或 8
+- 95 optimization steps × 5 epochs（等价于 Exp-014 形状）
+- 数据: 同 `v1.parquet` 20 条
+- Output: `/shared/rsaas/qiqianf2/lc_agent_experiments/grpo_v2_exp015{a,b,c,d}/`
+
+**代码改动**:
+- 新增 `run_grpo_v2_variant.sh`（通用 launcher，从 env var 读 `VARIANT_NAME` / `NUM_GENERATIONS` / `BETA` / `GRAD_ACCUM` / `MAIN_PROCESS_PORT`）
+- 4 个 sub file `grpo_v2_015{a,b,c,d}.sub`，每个通过 `environment = "..."` 传变体参数
+- 所有 launcher 改为从 `/home/qiqianf2/LC-Agent/.env` 读取 `DEEPSEEK_API_KEY`（上个 key 已作废）
+
+**部署踩坑**:
+1. `PROJECT_ROOT="$(cd dirname $BASH_SOURCE/../.." && pwd)` 在 condor 下失效（script 被 copy 到 `/srv/condor/execute/dir_XXX/`，相对路径指向 `/srv/condor/.env`）→ 改成绝对路径
+2. 2 GPU accelerate launch 默认都绑 port 29500，两个 job 落同节点就 EADDRINUSE → 给每个 variant 一个独立 `MAIN_PROCESS_PORT`（29501-29504）
+3. 只用了 4/8 GPU: 因为 c/d 先挂了 port 冲突 bug，resubmit 后恢复到 8 GPU 满载
+
+#### 中期结果（015a/b 完成，015c/d ~80% 时的 snapshot）
+
+Per-epoch reward 趋势:
+
+| Variant | ep0 | ep1 | ep2 | ep3 | ep4 | Δ(ep0→最新) | KL 峰值 |
+|---|---|---|---|---|---|---|---|
+| 015a g=4 β=0.01 ✅ | 0.619 | 0.588 | 0.553 | 0.570 | 0.633 | +0.014（flat）| 8.7e-4 |
+| 015b g=4 β=0.001 ✅ | 0.635 | 0.583 | 0.587 | 0.594 | 0.614 | **−0.021**（退步）| 3.9e-3 |
+| **015c g=8 β=0.01** 🟢 | 0.577 | 0.605 | 0.609 | **0.621** | 0.630* | **+0.044 单调上升** | 6.7e-4 |
+| 015d g=8 β=0.001 | 0.572 | 0.568 | 0.590 | 0.594 | — | +0.022（噪声大）| 6.2e-4 |
+
+*015c ep4 仅 4 个样本
+
+**std（同组内 reward 方差）分析**（用户提出的担忧：是不是组内区分不够）:
+
+| Variant | std mean | std max | std==0 比例 |
+|---|---|---|---|
+| 015a g=4 | 0.148 | 0.449 | **17%** |
+| 015b g=4 | 0.140 | 0.419 | **17%** |
+| 015c g=8 | 0.145 → **0.178 (ep3)** | 0.309 | 18% → 下降中 |
+| 015d g=8 | 0.160 | 0.337 | 4% |
+
+- 平均 std 0.14-0.16 意思是 4 rollouts 里大概 3 条得 0.6、1 条得 0.3，差别只有 1-2 个 rubric 子项
+- **17% 的 step 完全 zero-std**（所有 rollout 同分，advantage=0 → 该 step 白训）
+- **015c 的 std 随 epoch 上升**（0.148 → 0.178），group=8 真的把 rollout 多样性推出来了
+- Rubric 粒度粗（7 个 yes/no，每条权重 1-1.5，单 flip ≈ 0.09-0.14）是 std 上限的根本原因
+
+#### 关键发现
+
+1. **Exp-014 "reward 不涨" 是 group=4 advantage 太噪的锅**，不是模型学不会
+2. **015c (g=8, β=0.01) 是唯一 ep0→ep3 单调递增的 variant**：0.577 → 0.605 → 0.609 → 0.621，+0.044 over 3.5 epochs，不是单步波动
+3. 015b (弱 KL) 反而退步：说明 β=0.001 让 policy drift 过多，β=0.01 才是合适档
+4. **对比 Exp-014 baseline (0.596)**：015c ep3 = 0.621 是 +0.025，**第一次看到 reward 被 RL 真的推上去**
+
+#### 最终结果
+
+（015c/d 还在跑最后 1-1.5 epoch，完成后补）
+
+---
+
+### Exp-016: RL instance 数据扩量 v1 → v2（20 → 150）
+
+- **日期**: 2026-04-18
+- **目的**: v1 的 20 条 rubric-based instance 跑完 Exp-013 pre-flight 后（SFT mean 0.524，12 条有方差、8 条 std=0），数据量对 GRPO 偏少；按原 pipeline 扩到 ~150 条，给后续 RL 训练一个更稳定的 prompt pool
+- **阶段**: RL 数据扩量（不涉及训练）
+- **代码路径**:
+  - 生成脚本: `sft_rl_training/scripts/generate_rl_instances.py`（在 v1 基础上扩展）
+  - 关键改动:
+    - 新增 `NEW_ARCHETYPES` 列表（5 个 archetype）补 v1 覆盖不足的轴向
+    - 新增 `build_all_plans(base_plans, new_archetypes, variants_per_archetype)`：按"archetype × variant"笛卡尔积展开成 concrete plan 列表
+    - 新增 `VARIATION_SALT_POOL`（6 条 variation 提示）：给同 archetype 的不同 variant 注入具体差异要求（题型/难度、persona、措辞风格等）
+    - CLI 新增 `--variants-per-archetype` 和 `--skip-ids-in` 支持增量生成
+    - Prompt template 新增 `variation_hint` 段，告诉 codex 本 variant 要和其他 variant "具体内容不同"
+  - 调用方式：和 v1 一样用 `codex exec -s read-only -m gpt-5.3-codex`
+- **5 个新 archetype**（补 v1 覆盖不足的点）:
+  1. `review_weak_category_reinforce` — 复习 + L2 弱项驱动 + rich ws
+  2. `mid_hint_escalation` — 已给过轻提示 + 用户要再具体（hint 递进）
+  3. `mid_bug_complexity_tradeoff` — 代码对但复杂度不优（非逻辑 bug）
+  4. `pre_bulk_time_budget` — 有时间预算（30 min/睡前/午休），不要长 clarify
+  5. `mid_start_with_followup_twist` — 刚开题但问超出当前题的延伸问题
+- **布局**:
+  - rl_inst_0001-0020：v1 原版（20 archetype × variant 0），**不重新生成**
+  - rl_inst_0021-0120：v1 的 20 archetype × variants 1-5（100 条新生成）
+  - rl_inst_0121-0150：5 新 archetype × variants 0-5（30 条新生成）
+- **执行**:
+  - 后台跑 130 条生成（skip v1 的 20 条）
+  - codex medium effort，平均 ~45s/call（部分 variant 更复杂 70s+）
+  - 总耗时 ~100 min
+  - **0 fail**：130/130 全部 validation 通过（retry=2 作为保险，实际都一次过）
+- **结果**:
+  - `v1.jsonl` — 原 20 条，保留
+  - `v2_new.jsonl` — 新 130 条
+  - `v2.jsonl` = `v1.jsonl` + `v2_new.jsonl` = **150 条**，所有 id unique，25 archetype × 6 variants 每 archetype 恰好 6 条
+  - 路径: `/shared/rsaas/qiqianf2/lc_agent_experiments/rl_instances/{v1,v2_new,v2}.jsonl`
+- **下一步**:
+  1. 可选：在 v2 上重跑 Exp-013 pre-flight（三档 backbone × K=4 rollout × 150 instance × DeepSeek judge）估计成本：rollout ~3-4h，judge ~2h，API 费用约 ¥15-25。值不值看 Exp-015 方向再定
+  2. 直接拿 v2.jsonl 作为 GRPO 训练集，增量对比 Exp-015 系列（20 条）的结果；如果训练集从 20 扩到 150 能把 Exp-015 发现的 zero-std step 比例从 17% 拉下来，就是扩量的主要收益
+
+---
+
+### Exp-017: leetcode_agent v0.6（atomic tools）归档 + headless 模式重构
+
+- **日期**: 2026-04-18
+- **目的**: 软件侧做了两件大事，数据/训练侧做相应基建：(1) leetcode_agent 的 tool schema 从旧版（`search_problem`/`pick_problem` 含 UI 副作用）重构为新 atomic 版（`search_leetcode` + `list_hot_problems` + `let_user_pick` 三个原子 tool，descriptions 不再规定调用时机），system prompt 同步去规则化；(2) 旧 SFT/RL 产物里的 tool name 在新 schema 下不存在，无法直接复用，需要先把旧产物归档 + 为新数据生成准备好 no-interact 路径
+- **阶段**: 软件切换 + 基建（不涉及训练）
+- **软件层改动**（`leetcode_agent/` 旧目录备份为 `leetcode_agent_old/`）:
+  - `lc/agent.py` SYSTEM_PROMPT 去规则化：从 "用户说X→用Y" 的硬 if-then 改为"以下只说明每个工具做什么，不规定调用时机和顺序"
+  - tool 拆原子：旧 `search_problem`（搜索+UI+返回 selected_id）→ 新 `search_leetcode`（纯数据）+ `let_user_pick`（纯 UI）；旧 `pick_problem` 同理拆为 `list_hot_problems` + `let_user_pick`
+  - 新增纯数据/纯 UI 工具：`display_problem`（纯渲染）、`fetch_problem_detail`（纯拉 API）、`list_practiced`（纯 DB 读）
+  - agent loop 小改：API fail 时回滚整个 turn 防 orphaned `tool_calls`；`_INTERACTIVE_TOOLS = {"let_user_pick"}`；`write_memory` 移出 serial 列表可并行
+  - 旧版的 `LC_MAX_REACT_STEPS` env override 移除（固定 30 步）
+- **归档位置**: `/shared/rsaas/qiqianf2/lc_agent_archive_2026-04-18/`
+  - `local/`（从 home/tmp 搬来）: `workspaces/{a,b,c}`（旧 SFT 3 个 shard 的 CWD）、`tmp_homes/{b,c}`、`logs/sft_rl_logs.tar.gz`（80+ 条 condor 日志打 tar）、`pycache/`、`stray_scripts/`（2 条误落下的 claude caveat txt）
+  - `shared/`（从 `/shared/rsaas/qiqianf2/lc_agent_experiments/` 搬来，~28 GB）:
+    - 废 SFT 产物: `sft_real_exp002/` (Exp-002 adapter), `sft_merged_model{,.gguf,_q8_0.gguf}` (Exp-002 merged + GGUF)
+    - 废 RL 产物: `grpo_dryrun/`, `grpo_v1_exp014/`, `grpo_v2_exp015/`（第一次 NFS 卡死）, `grpo_v2_exp015{a,b,d}/`（三个无信号 variant）
+    - 废 checkpoints: `sft_exp008_unused_checkpoints/checkpoint-{20,40,80,100}`（Exp-009 非最优 ckpt，保留 ep3 ckpt-60）
+    - 过时数据: `rl_prompts.parquet`（Exp-003 的单轮 RL prompts）, `grpo_trl_exp001/`（空目录）
+  - `ARCHIVE_README.md`: 每个归档条目的原位置、产生实验、用途、归档原因、恢复方法
+- **保留未动**（仍供新流程使用）: `sft_trajectories/`（历史数据）、`sft_exp008/checkpoint-60/` + 顶层 adapter（Exp-009 ep3）、`sft_exp009_merged/`（RL 起点）、`grpo_v2_exp015c/`（唯一有信号的 RL variant）、`rl_instances/`、`benchmark_results/`
+- **Headless 模式**（软件本体支持）:
+  - `lc/config.py` 新增 `is_headless()` 运行期查询 `LC_HEADLESS` env
+  - `lc/ui.py::arrow_select` 头部加分支：headless 时 `random.choice(choices)[1]`，不碰 tty
+  - `lc/agent.py::_call_model_once` 头部加分支：headless 时走新的 `_call_model_once_headless`，非流式（无 Rich Live），保留 prompt_cache_hit_tokens metric
+  - 目的：未来的 SFT 数据生成 / RL rollout / eval 脚本都只需 `os.environ["LC_HEADLESS"]="1"` 即可安全 scripted 跑，不用再像旧 `generate_trajectories.py` 那样 monkey-patch 5 处内部符号
+- **Smoke test**: `sft_rl_training/scripts/smoke_test_headless.py`
+  - 3-turn 对话 + isolated tmpdir + isolated HOME + 独立 DB
+  - turn 1 "我想做第 1 题"：agent 成功调 `check_problem → start_problem → display_problem → fetch_problem_detail`，返回文字指导
+  - turn 2 "我的思路是用哈希表"：纯对话回复
+  - turn 3 "做完了，帮我总结一下"：`read_solution → analyze_and_memorize → find_problem_file → append_solution → read_memory`，完整结束
+  - `l3_written: true`，24 条 message，全程无阻塞
+  - 补充测试：`arrow_select([("A",1),("B",2),("C",3)])` 在 LC_HEADLESS=1 下返回 `2`，随机选中
+- **观察**:
+  - 两次 smoke test 都没触发 `let_user_pick`（模型拿到 `search_leetcode` 结果后直接挑一个 start）——新 atomic 设计下模型更倾向自主决策而非弹用户选择器，让 SFT 数据的 tool call 模式和旧版会不同
+  - 原脚本 `generate_trajectories.py` 里的 headless patch 可以全部删掉，只需 `os.environ["LC_HEADLESS"]="1"`
+- **下一步**: 旧 SFT 数据生成脚本全部基于旧 tool name，需要重新设计 SFT 数据的采集方案（新 tool 组合 + 可能需要新的 clarify/no-tool/free 分布）。准备工作完成，等下一步指示
+
+---
+
+### Exp-018: SFT 数据 v2 重新设计（第一类：structured + free）
+
+- **日期**: 2026-04-18
+- **目的**: Exp-017 之后旧 SFT 数据全部作废（tool schema 变了），需要按新 atomic-tool 架构重新设计 3 类 SFT 数据。本 Exp 专门处理**第一类：DeepSeek 规则生成的 structured + free 轨迹**。后续 Exp 分别处理第二类"拒绝模糊指令（clarify）"和第三类"自采样不调工具的对话（no-tool）"
+- **阶段**: SFT 数据设计（不涉及训练）
+
+#### 新旧数据差异分析
+
+Smoke test 实测 + 对比旧 `generate_trajectories.py`，结论：
+
+| 维度 | 旧（Exp-002 511 条） | 新 | 影响 |
+|---|---|---|---|
+| Step 1 variant → tool 调用 | topic→1 次 `search_problem`；random→1 次 `pick_problem`；specific→1 次 `start_problem` | topic 实测 5 步链 (`list_practiced`→`list_hot_problems`→`search_leetcode`→`check_problem`→`start_problem`)；specific 实测 4 步链 | 同 variant 的 tool 链不唯一、更长；不硬挑"最短链" |
+| Workspace | 3 个 shard 共用，`.memories` 跨轨迹累积 | **每条 trajectory 独立 tmpdir**（对齐 Exp-011 environment_factory） | 彻底消除 shard 污染，可以并行几十进程 |
+| `let_user_pick` 触发 | 旧 tool 内置 UI，每条轨迹必弹 | 独立 UI tool，默认不触发 | 新 agent.py 更新了 tool 描述增强触发概率（"候选势均力敌、用户显得想自选时"），让**自然分布**产出 |
+| `find_similar_problems` | system prompt 硬规则"立即调" | system prompt 移除硬规则 → 用户后续在 agent.py 加"产品核心行为"段重新列为刚性规则（`start_problem` 之后必调） | 数据生成时**丢弃未触发该工具的轨迹**，相当于强 SFT 该行为 |
+| L2 user_memory | 单一默认（空或聊天过程中累积） | **3 套 persona 预填**（expert / beginner / intermediate），每条 trajectory 随机抽一套 | 让模型学到"同一问题对不同水平用户给不同深度回复" |
+| Ending tool 链 | 2 步 (`read_solution` → `analyze_and_memorize`) | 接受自然延长（实测 5 步：多出 `find_problem_file` → `append_solution` → `read_memory`）| 不过滤，让模型学"给参考解法 + 验证记忆"的行为 |
+| Step 1 variant 数量 | 3 类 (random/specific/topic) | **保持 3 类** | 新覆盖靠 L2 persona × variant 组合增加 |
+| Headless 实现 | 5 处 monkey-patch | `os.environ["LC_HEADLESS"]="1"` 即可（Exp-017 软件本体支持） | 脚本代码量显著减少 |
+| Solution file 定位 | `find_latest_solution_file()` scan filesystem | 从 `start_problem` tool_result 的 `file` 字段直接取 | 更 robust，没 race condition |
+
+#### 软件侧 agent.py 配套改动（用户手工）
+
+在 `SYSTEM_PROMPT` 里增加了两块让新 atomic tool 有更高触发率：
+
+1. **`let_user_pick` 的 tool description 扩写**：明说适用场景（候选势均力敌 / 用户想自选 / 推荐不够自信），但"明显最优推荐时直接 `start_problem`"
+2. **"产品核心行为（刚性规则）" 段**：`start_problem` 之后必须调 `find_similar_problems`，作为本应用的"产品身份行为"而非"工具自主推理"
+
+这两条等于把原本去规则化的系统 prompt 里**少量必要的产品刚需**重新拉回硬规则。平衡点：不规定"怎么选题"，但规定"做完一步之后必须 memory 辅导"。
+
+#### Persona 预填设计（3 套）
+
+每条 trajectory 跑前从三套随机选一套，覆盖到：
+- L2 `user_memory.md`：persona 文本
+- 预填的 `.memories/*.md` 子集：代表该 persona 的做题历史
+- 保留的 `category/*.py` 子集：代表该 persona 已打开过的题
+
+**P_expert（高手）**
+- L2: Python、迭代优先、最小提示、直接讨论进阶；掌握 二分/DP 常见/BFS/DFS/回溯/堆；薄弱 单调栈/并查集/线段树
+- Workspace: 保留全部 7 个 category + 全部 12 条 `.memories`（覆盖 easy/medium/hard，DP 最丰富）
+
+**P_beginner（新手，刚学 DFS/BFS）**
+- L2: Python、希望详细注释、完整思路讲解；已掌握 数组遍历/双指针/哈希表；正在学 DFS/BFS；薄弱 DP/树
+- Workspace: 仅 `two_pointers/` 全部 + `dfs_bfs/200,46`；`.memories` 仅 3(substring)/15(3sum)/70(climbing stairs easy)
+
+**P_intermediate（中等，正在学 DP）**
+- L2: Python、习惯二维 dp、对空间压缩不熟；掌握 双指针/二分/BFS/DFS 基础/LIS/编辑距离；正在学 DP 扩展；薄弱 coin change 类/回溯剪枝
+- Workspace: `dp/` 只保 300、72、53；`.memories` 这 3 个 + 双指针的 3、15
+
+#### Workspace 模板清洗计划
+
+核查发现 `leetcode_agent_old/` 的状态不完全对齐：
+
+| 维度 | 状况 |
+|---|---|
+| `.py` 文件（7 个 category）| 25 条 |
+| `.memories/*.md` | 12 条 |
+| 全局 DB `~/.leetcode_agent/leetcode.db` 的 `problem_memories` | >100 行 |
+| 其中 `memory_file` 相对路径 `.memories/...` | 真实用户历史 |
+| 其中 `memory_file` 绝对路径指向 `sft_rl_training/workspace/...` | SFT 训练残留（目录已归档，dangling）|
+
+**12 条完整记录（.py + .memories + DB 三者齐全）**: 3、5、15、53、70、72、103、300、322、1143、1407、3693
+
+**13 条仅 `.py` 无 `.memories`**（用户开题但未写总结）: 1、19、25、33、46、92、102、146、200、206、215、236、543、695
+
+清洗步骤:
+1. 从全局 DB 导出仅 `memory_file LIKE '.memories/%'` AND 文件实际存在的行 → 形成干净 DB subset
+2. 新建 `/shared/rsaas/qiqianf2/sft_workspace_templates/{expert,beginner,intermediate}/`
+3. 按 persona copy 对应的 `category/*.py` + `.memories/*.md` + DB subset + 写入 `user_memory.md`
+4. `.py` 保留不修改，作为 agent "当前题目可见" 的参考状态
+
+#### TODO 清单（待执行）
+
+- [ ] 清洗全局 DB → 生成 `clean_problem_memories.sql` export
+- [ ] 建 3 个 persona 的 workspace template（`expert` / `beginner` / `intermediate`）
+- [ ] 写 `generate_trajectories_v2.py` 骨架：
+  - 独立 tmpdir + `cp -r template/{persona}` + `LC_HEADLESS=1`
+  - 3 个 step1 variant (random / specific / topic) 保持旧逻辑
+  - DeepSeek 模拟用户写代码（correct/buggy/partial）
+  - 1/3 概率的 midstep 问答
+  - Ending message + 接受自然延长的 tool 链
+  - **Filter**: 丢弃未触发 `find_similar_problems` 的轨迹；丢弃无 `l3_written: true` 的轨迹
+  - 输出 JSONL，每条带 `persona` / `step1_variant` / `code_quality` / `has_midstep` metadata
+- [ ] Smoke run 3-5 条 trajectory，人眼 review 质量
+- [ ] 按 trajectory 目标数（先 200 条起步）批量跑
+
+数据路径规划: `/shared/rsaas/qiqianf2/lc_agent_experiments/sft_trajectories_v2/structured_v2.jsonl`
+
+#### 决策快照
+
+| Q | 选择 |
+|---|---|
+| 独立 tmpdir？ | yes |
+| Workspace 预填？ | 复用 leetcode_agent_old 的 `.memories` + DB（清洗后）+ 3 persona 分流 |
+| `let_user_pick` 处理？ | A 自然触发（agent.py 已强化描述） |
+| 强制 `find_similar_problems`？ | 不硬编码，用 filter 丢弃未触发的轨迹（加 agent.py 刚性规则段） |
+| step1 variant 扩展？ | 保持旧 3 类（random/specific/topic），靠 persona 组合增加多样性 |
+| Ending 链是否接受延长？ | 接受，不过滤 |
+
+#### Smoke 测试结果
+
+**代码路径**: `sft_rl_training/scripts/generate_trajectories_v2.py` + `free_intents_v2.txt`
+
+**Workspace templates**: `/shared/rsaas/qiqianf2/sft_workspace_templates/{expert,beginner,intermediate}/`
+- expert: 12 L3 memories + 26 .py + DB 12 行
+- intermediate: 6 L3 + 10 .py + DB 6 行
+- beginner: 2 L3 + 6 .py + DB 2 行
+- 每个模板有 `.leetcode_agent/{leetcode.db, user_memory.md}` 定义 persona
+
+**Structured smoke (n=3, seed=42)**: 3/3 saved (0 drop)
+
+| # | persona | step1 | code | msgs | 关键观察 |
+|---|---|---|---|---|---|
+| 1 | intermediate | random/correct | 16 | 精简 happy path，6 tools |
+| 2 | expert | random/correct+mid | 22 | 多调 `display_problem` + `read_memory` 验证 |
+| 3 | beginner | topic/buggy | 44 | 高质量：主动**教学 + 推荐第二道题**；fallback `search_leetcode`；`list_hot_problems` 返回非 DP → 转 `search_leetcode("climbing stairs")` |
+
+Traj 3 展示了 persona 生效：beginner L2 里说"DP 完全不会"，agent 果然挑了最简单的 70 climbing stairs，写详细教学解答。
+
+**Free smoke (n=3 target, seed=7)**: 3/8 saved, drop_rate 62.5%
+- 所有 8 次都 `start_problem` 成功
+- 3/8 (37.5%) 还补调了 `find_similar_problems` → accept
+- 5/8 没补调 → drop "started_without_find_similar"
+- 结论：DeepSeek 对"start_problem → find_similar" 刚性规则的遵守度在 free 多轮场景下约 37%；在 structured 三步场景下 100%。free 的多轮 user follow-up 可能让 model "忘记"
+
+**Yield 估算**（给批量跑参考）:
+- Structured: 假设 yield ~90%，n*1.2 × ~100s/attempt
+- Free: yield ~37%，n*3 × ~100s/attempt
+
+**Filter 逻辑差异**（两模式不同）:
+- Structured：严格（start + find_similar + l3 全要）
+- Free：宽松（如果 started 则必须 find_similar；**不强制** l3，因为 free chat 常无"做完了"信号）
+
+#### 遗留问题 / 后续
+
+1. **刚性规则遵守率在 free 模式偏低**（37% vs structured 100%）。后续可能需要：
+   - 加强 system prompt 表述（"每次 start_problem 后"改成更强烈措辞）
+   - 或接受 37% yield，靠多生成弥补
+   - 训练出的模型本身应该比 DeepSeek 更严格遵守（SFT 过滤器保证了训练集 100% 合规）
+2. **smoke trajectory 最长 44 条 msgs**（beginner + agent 主动教学 + 推荐第二题），目前接受。如果批量跑出现 >80 条 msg 的 trajectory，考虑加长度上限
+3. **Free mode 下 `l3_written=False`** 的轨迹目前接受。如果后续发现这让 SFT 模型学不到 "做完题后 analyze_and_memorize"，可加额外"强制 analyze"的结束消息或单独训 subtask
+
+#### 首批正式生成结果（2026-04-19）
+
+4 shard 并行，总用时 ~2h10min wall clock（login node，DeepSeek API-driven）:
+
+| Shard | Target | Saved | Failed | Attempts | Yield |
+|---|---|---|---|---|---|
+| structured_v2_a (seed=42) | 50 | 50 | 18 | 68 | 74% |
+| structured_v2_b (seed=123) | 50 | 50 | 24 | 74 | 68% |
+| free_v2_a (seed=7) | 25 | 25 | 20 | 45 | 56% |
+| free_v2_b (seed=300) | 25 | 25 | 15 | 40 | 62% |
+| **TOTAL** | **150** | **150** | 77 | 227 | **66%** |
+
+**输出路径**:
+- 分 shard: `/shared/rsaas/qiqianf2/lc_agent_experiments/sft_trajectories_v2/{structured,free}_v2_{a,b}.jsonl`
+- 合并: `structured_v2_all.jsonl` (100 条 / 2.5M), `free_v2_all.jsonl` (50 条 / 1.4M), `class1_v2_all.jsonl` (150 条 / 3.9M)
+
+**Persona 分布（全部 150 条）**: beginner 54 (36%), intermediate 48 (32%), expert 48 (32%) — 均衡
+
+**Structured (step1 × code_quality) 分布（100 条）**: 9 个 bucket 全覆盖；specific+correct=19 最高，specific+partial=2 最低
+
+**Msg 长度**: min=12, p25=20, median=22, p75=26, max=56, mean=23.3 — 健康
+
+**行为触发率（150 条内）**:
+- `start_problem` 被调: 139 (93%) — 7% free trajectories 纯闲聊没起题
+- `find_similar_problems` 被调: 141 (94%) — filter 保证的刚性规则
+- `analyze_and_memorize` 成功写 L3: 105 (70%) — structured 基本必触发，free 没有做完信号所以少
+
+**Drop 归因（77 条失败）**:
+- `started_without_find_similar`: 35 (45%) — 主要在 free，DeepSeek 不稳定遵守刚性规则
+- `no_l3`: 32 (42%) — structured ending 阶段 DeepSeek 没调 analyze_and_memorize
+- `no_find_similar`: 10 (13%) — structured started 但跳过 find_similar
+
+**规模**: ~334K tokens 总内容（按 chars/4 粗估）— 对于 class-1 单独来说偏小，但加上 class-2（clarify）+ class-3（no-tool）后预期 500+ 条够 SFT 用了
+
+**结论**: 首批 class-1 数据 ready。可以进入 class-2 (clarify 拒绝模糊指令) 设计，或者先攒够三类再合并做 train/val split
+
+#### 第二、第三类数据生成（2026-04-19 续）
+
+**Class 2 clarify（模糊指令 → 反问）**: 沿用 Exp-006 pattern 加到 `generate_trajectories_v2.py` 作为 `--mode clarify`
+- 复用 structured 模式的 persona workspace + 独立 tmpdir + quality gate
+- Step 0 vague opener: 70% seed / 30% LLM 生成（带 bad-marker 过滤）
+- 关键 filter: first-turn assistant 必须**不能** tool_call（否则不是 clarify 示例）
+- Step 1+ 沿用 structured flow（concrete follow-up → code sim → midstep → ending → analyze）
+- **Seed 优化**: 去掉原有动作暗示的 seed（"我想进步" / "给我点建议" / "帮我规划一下"），改用纯情绪/犹豫词 ("嗯…" / "emm" / "哎" / "呃…" / "你说呢？" / "脑子一片空白" 等 20 个)；smoke yield 从 11% 升到 30%（batch 实际稳态 20%）
+
+**Class 3 no-tool（自采样纯文字对话）**: 新脚本 `generate_no_tool_v2.py`
+- **Self-distill from Qwen3-1.7B-Instruct**（不走 DeepSeek），对齐 Exp-007 pattern
+- 6 个类别 × K=3 over-sample × 硬规则 + DeepSeek LLM-as-judge
+- Hard rules: 无 `<tool_call>` 标签 / 5-800 char / 行重复度 <50%
+- 复用 `sft_trajectories/no_tool_scenarios.json` 的 307 个 scenario（cache 直接可用，用户意图不依赖新 tool schema）
+- mid_problem_chat 类从 `structured_v2_all.jsonl` 抽前缀作为 context
+- Persona L2 随机选一套，`build_system_prompt_with_persona()` 复刻 agent.py 的合并逻辑
+- 2-turn 比例 40%（ambiguous_intent 保持 1-turn only 避免语义冲突）
+
+#### 首批批量跑结果（2026-04-19 evening）
+
+全部跑在 vision-h01（login node A10 GPU + DeepSeek API）：
+
+| Class | Target | Saved | Fails | Yield | 说明 |
+|---|---|---|---|---|---|
+| 1 structured | 100 | 100 | 42 | 70% | 2 shard 并行 ~2h |
+| 1 free | 50 | 50 | 35 | 59% | 2 shard 并行 ~1.5h |
+| 2 clarify | 50 | 50 | 194 | **20%** | 2 shard 并行 ~1.5h，主 drop 在 first-turn tool_call |
+| 3 no-tool | 50 | 30 | 30 | 62% | single shard + Qwen3-1.7B ~13min |
+| **TOTAL** | **250** | **250** | 301 | 45% | |
+
+**Clarify yield 偏低（20%）原因分析**:
+- 194 drops 里: 70% `clarify_tool_called_on_vague`（agent 直接 tool 不反问）, 25% `no_find_similar`, 5% `no_l3`
+- Persona 分布严重偏 beginner（21/50 saved 里 beginner 12, intermediate 10, expert 仅 2）— **expert L2 太强，agent 自信填空，几乎不触发反问**。可接受，是 SFT 训练目标本身倾向 beginner/intermediate 场景
+- 后续如需更多 clarify 数据，可考虑：(a) 给 expert persona 也生成 clarify（降权其 L2）；(b) 放宽 filter（允许 first turn 部分 tool calls 如 list_practiced 探索，仅拒绝 start_problem）
+
+**最终数据规模**:
+- 250 条 trajectories，总 content ~1.9M chars (~475K tokens 粗估)
+- msgs/traj: median=22, p95=36, max=56, min=3
+- Persona 分布: beginner 93 (37%), expert 81 (32%), intermediate 76 (30%) — 均衡
+- 合并文件: `/shared/rsaas/qiqianf2/lc_agent_experiments/sft_trajectories_v2/sft_v2_all.jsonl` (6.0M, 250 条)
+
+**Class-wise 数据路径**:
+- `structured_v2_all.jsonl` (100 条, 2.5M)
+- `free_v2_all.jsonl` (50 条, 1.4M)
+- `clarify_v2_all.jsonl` (50 条, 1.3M)
+- `no_tool_v2.jsonl` (50 条, 772K)
+- `sft_v2_all.jsonl` (250 条, 6.0M) ← 训练总集
+
+#### 下一步
+
+SFT 训练数据齐全。等用户决定：
+1. 走下一轮 SFT 训练（改 lr / epochs / LoRA rank / + v2 data merge）
+2. 再补数据（提高某一类比例、生成更长的 multi-turn 等）
+3. 做 held-out benchmark 更新（旧 Exp-008 的 benchmark 基于旧 tool schema，已失效）
+
+---
+
+（后续实验记录从下方开始）
 
 ---
 
